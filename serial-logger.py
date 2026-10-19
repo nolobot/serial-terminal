@@ -13,13 +13,14 @@ Features:
     * ANSI color support (ESP-IDF style logging colors)
     * Line-based display: a line is complete only when "\r\n" is received (any OS)
     * Live text filter (applied to complete lines)
-    * Configurable macro buttons (text sent + "\r\n")
+    * Configurable macro buttons (edit/label next to each button; text sent + line ending)
     * RTS / DTR toggles and CTS / DSR / RI / CD indicators
     * Send box at the bottom (text sent + "\r\n")
     * Dark theme
 """
 
 import json
+import math
 import queue
 import re
 import sys
@@ -316,19 +317,62 @@ class SerialApp(tk.Tk):
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
-        # Macro bar: packed first with side="bottom" so it sits at the very bottom,
-        # below the send bar.
+        # Packed with side="bottom": first widget is at the very bottom.
+        # Order from bottom to top: Highlights, Macros, Send.
+        hf = ttk.LabelFrame(self, text="Highlights", padding=6)
+        hf.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+        for i, (en, tx) in enumerate(self.hl_vars):
+            slot = ttk.Frame(hf)
+            slot.grid(row=0, column=i, sticky="ew", padx=4)
+            hf.columnconfigure(i, weight=1, uniform="hl")
+            ttk.Checkbutton(slot, text=str(i + 1), variable=en,
+                            command=self._schedule_rehighlight).pack(side="left")
+            btn = tk.Button(slot, width=1, height=1, relief="flat", bd=0,
+                            padx=0, pady=0, cursor="hand2",
+                            bg=self.hl_colors[i], activebackground=self.hl_colors[i],
+                            highlightthickness=1, highlightbackground=BORDER,
+                            command=lambda i=i: self._pick_highlight_color(i))
+            btn.pack(side="right", padx=(4, 0))
+            self.hl_btns.append(btn)
+            ttk.Entry(slot, textvariable=tx, width=10).pack(
+                side="left", fill="x", expand=True)
+            tx.trace_add("write", lambda *a: self._schedule_rehighlight())
+
         mf = ttk.LabelFrame(self, text="Macros", padding=6)
-        mf.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+        mf.pack(side="bottom", fill="x", padx=8, pady=(0, 2))
         self.macro_buttons = []
+        self.macro_name_lbls = []
+        self.macro_preview_lbls = []
+        preview_font = (self._mono_font()[0], 8)
         for i in range(NUM_MACROS):
-            b = ttk.Button(mf, command=lambda i=i: self.send_macro(i))
-            b.grid(row=0, column=i, sticky="ew", padx=2)
+            cell = ttk.Frame(mf)
+            cell.grid(row=0, column=i, sticky="nsew", padx=2)
             mf.columnconfigure(i, weight=1, uniform="macro")
-            self.macro_buttons.append(b)
+
+            side = ttk.Frame(cell)
+            side.pack(side="right", padx=(3, 0))
+            self._icon_button(side, "gear", "Edit text to send",
+                              lambda i=i: self._edit_macro_text(i)).pack(pady=(0, 3))
+            self._icon_button(side, "tag", "Edit button label",
+                              lambda i=i: self._edit_macro_label(i)).pack()
+
+            send = tk.Frame(cell, bg=BG_INPUT, highlightthickness=1,
+                            highlightbackground=BORDER, cursor="hand2")
+            send.pack(side="left", fill="both", expand=True)
+            name = tk.Label(send, bg=BG_INPUT, fg=FG, anchor="w")
+            name.pack(fill="x", padx=6, pady=(4, 0))
+            preview = tk.Label(send, bg=BG_INPUT, fg=FG_DIM, anchor="w",
+                               font=preview_font)
+            preview.pack(fill="x", padx=6, pady=(0, 4))
+            for w in (send, name, preview):
+                w.bind("<Button-1>", lambda e, i=i: self.send_macro(i))
+                w.bind("<Enter>", lambda e, i=i: self._macro_hover(i, True))
+                w.bind("<Leave>", lambda e, i=i: self._macro_hover(i, False))
+            self.macro_buttons.append(send)
+            self.macro_name_lbls.append(name)
+            self.macro_preview_lbls.append(preview)
         self._refresh_macro_buttons()
 
-        # Send bar (sits directly above the macro bar)
         bottom = ttk.Frame(self, padding=(8, 4, 8, 6))
         bottom.pack(side="bottom", fill="x")
         ttk.Label(bottom, text="Send:").pack(side="left")
@@ -340,25 +384,6 @@ class SerialApp(tk.Tk):
         self.send_btn = ttk.Button(bottom, text="Send", style="Accent.TButton",
                                    command=self.send_entry_text)
         self.send_btn.pack(side="left")
-
-        # Highlight bar (directly above the send bar)
-        hf = ttk.LabelFrame(self, text="Highlights", padding=6)
-        hf.pack(side="bottom", fill="x", padx=8, pady=(0, 2))
-        for i, (en, tx) in enumerate(self.hl_vars):
-            slot = ttk.Frame(hf)
-            slot.grid(row=0, column=i, sticky="ew", padx=4)
-            hf.columnconfigure(i, weight=1, uniform="hl")
-            ttk.Checkbutton(slot, text=str(i + 1), variable=en,
-                            command=self._schedule_rehighlight).pack(side="left")
-            btn = tk.Button(slot, width=2, relief="flat", bd=0, cursor="hand2",
-                            bg=self.hl_colors[i], activebackground=self.hl_colors[i],
-                            highlightthickness=1, highlightbackground=BORDER,
-                            command=lambda i=i: self._pick_highlight_color(i))
-            btn.pack(side="left", padx=(2, 4), fill="y")
-            self.hl_btns.append(btn)
-            ttk.Entry(slot, textvariable=tx, width=10).pack(
-                side="left", fill="x", expand=True)
-            tx.trace_add("write", lambda *a: self._schedule_rehighlight())
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
@@ -462,19 +487,6 @@ class SerialApp(tk.Tk):
                      "the send line ending applies immediately.",
             foreground=FG_DIM)
         self.settings_note.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        mf = ttk.LabelFrame(parent, text="Macros (text is sent followed by the selected line ending)",
-                            padding=12)
-        mf.pack(fill="x", pady=(12, 0))
-        mf.columnconfigure(2, weight=1)
-        ttk.Label(mf, text="#", foreground=FG_DIM).grid(row=0, column=0)
-        ttk.Label(mf, text="Button label", foreground=FG_DIM).grid(row=0, column=1, sticky="w")
-        ttk.Label(mf, text="Text to send", foreground=FG_DIM).grid(row=0, column=2, sticky="w")
-        for i, (lv, tv) in enumerate(self.macro_vars, start=1):
-            ttk.Label(mf, text=str(i)).grid(row=i, column=0, padx=(0, 6))
-            ttk.Entry(mf, textvariable=lv, width=16).grid(row=i, column=1, pady=2, padx=(0, 8))
-            ttk.Entry(mf, textvariable=tv).grid(row=i, column=2, sticky="ew", pady=2)
-            lv.trace_add("write", lambda *a: self._refresh_macro_buttons())
 
         ttk.Button(parent, text="Save settings", command=self._save_and_note
                    ).pack(anchor="e", pady=12)
@@ -619,8 +631,11 @@ class SerialApp(tk.Tk):
         self.connect_btn.configure(text="Disconnect" if on else "Connect")
         state = "normal" if on else "disabled"
         self.send_btn.configure(state=state)
-        for b in self.macro_buttons:
-            b.configure(state=state)
+        for i, send in enumerate(self.macro_buttons):
+            send.configure(cursor="hand2" if on else "arrow")
+            fg = FG if on else FG_DIM
+            self.macro_name_lbls[i].configure(fg=fg)
+            self._macro_hover(i, False)
         flow = self.flow_var.get() if not on else (
             "RTS/CTS" if self.ser.rtscts else "DSR/DTR" if self.ser.dsrdtr else "")
         self.rts_btn.configure(state="disabled" if flow == "RTS/CTS" else "normal")
@@ -678,16 +693,181 @@ class SerialApp(tk.Tk):
             self.send_var.set("")
 
     def send_macro(self, i):
+        if not self.connected:
+            return
         text = self.macro_vars[i][1].get()
         if not text:
-            self._sys(f"Macro {i + 1} has no text configured (see Config tab).")
+            self._sys(f"Macro {i + 1} has no text configured (click the gear icon).")
             return
         self._write_line(text)
 
+    def _icon_button(self, parent, kind, tooltip, command):
+        size = 16
+        cv = tk.Canvas(parent, width=size, height=size, bg=BG,
+                       highlightthickness=0, cursor="hand2", borderwidth=0)
+        self._draw_icon(cv, kind, size, FG_DIM, BG)
+        tip = {"win": None}
+
+        def redraw(color, bg):
+            cv.configure(bg=bg)
+            self._draw_icon(cv, kind, size, color, bg)
+
+        def show_tip():
+            if tip["win"] is not None:
+                return
+            w = tk.Toplevel(cv)
+            w.wm_overrideredirect(True)
+            w.configure(bg=BORDER)
+            tk.Label(w, text=tooltip, bg=BG_ALT, fg=FG, padx=6, pady=2).pack()
+            w.geometry(f"+{cv.winfo_rootx()}+{cv.winfo_rooty() + size + 6}")
+            tip["win"] = w
+
+        def hide_tip():
+            if tip["win"] is not None:
+                tip["win"].destroy()
+                tip["win"] = None
+
+        def enter(_e):
+            redraw(FG, "#3e3e42")
+            show_tip()
+
+        def leave(_e):
+            redraw(FG_DIM, BG)
+            hide_tip()
+
+        def click(_e):
+            hide_tip()
+            # Open after this click finishes so the same mouse-up cannot
+            # dismiss the dialog before the user types anything.
+            self.after_idle(command)
+
+        cv.bind("<Button-1>", click)
+        cv.bind("<Enter>", enter)
+        cv.bind("<Leave>", leave)
+        return cv
+
+    @staticmethod
+    def _draw_icon(cv, kind, size, color, bg):
+        cv.delete("all")
+        cx = cy = size / 2.0
+        if kind == "gear":
+            teeth, r_tip, r_root, r_hole = 6, size * 0.46, size * 0.30, size * 0.10
+            pts = []
+            da = 2 * math.pi / teeth
+            for t in range(teeth):
+                a = t * da
+                for ang, r in (
+                    (a - da * 0.18, r_root),
+                    (a - da * 0.10, r_tip),
+                    (a + da * 0.10, r_tip),
+                    (a + da * 0.18, r_root),
+                ):
+                    pts.extend((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+            cv.create_polygon(pts, fill=color, outline=color, smooth=False)
+            cv.create_oval(cx - r_hole, cy - r_hole, cx + r_hole, cy + r_hole,
+                           fill=bg, outline=bg)
+        else:  # tag
+            pts = (2, 3, 10, 3, 14, 8, 10, 13, 2, 13)
+            cv.create_polygon(pts, fill=color, outline=color)
+            cv.create_oval(4, 6.5, 7.2, 9.7, fill=bg, outline=bg)
+
+    def _macro_hover(self, i, on):
+        if not getattr(self, "macro_buttons", None) or i >= len(self.macro_buttons):
+            return
+        send = self.macro_buttons[i]
+        if not on:
+            try:
+                x = send.winfo_pointerx() - send.winfo_rootx()
+                y = send.winfo_pointery() - send.winfo_rooty()
+                if 0 <= x < send.winfo_width() and 0 <= y < send.winfo_height():
+                    return
+            except tk.TclError:
+                pass
+        bg = "#3e3e42" if on and self.connected else BG_INPUT
+        send.configure(bg=bg)
+        self.macro_name_lbls[i].configure(bg=bg)
+        self.macro_preview_lbls[i].configure(bg=bg)
+
+    def _ask_string(self, title, prompt, initial=""):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(True, False)
+        ttk.Label(win, text=prompt).pack(padx=12, pady=(12, 4), anchor="w")
+        var = tk.StringVar(value=initial)
+        ent = ttk.Entry(win, textvariable=var, width=48)
+        ent.pack(fill="x", padx=12)
+        result = {"value": None}
+
+        def ok(_e=None):
+            result["value"] = var.get()
+            win.destroy()
+            return "break"
+
+        def cancel(_e=None):
+            win.destroy()
+            return "break"
+
+        bf = ttk.Frame(win)
+        bf.pack(pady=12)
+        ttk.Button(bf, text="OK", style="Accent.TButton", command=ok).pack(
+            side="left", padx=4)
+        ttk.Button(bf, text="Cancel", command=cancel).pack(side="left")
+        ent.bind("<Return>", ok)
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", cancel)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.update_idletasks()
+        px = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
+        py = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{px}+{py}")
+        ent.focus_set()
+        ent.icursor("end")
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        win.wait_window()
+        return result["value"]
+
+    def _edit_macro_text(self, i):
+        value = self._ask_string(
+            f"Edit macro {i + 1}",
+            "Text to send (the selected line ending is appended):",
+            self.macro_vars[i][1].get())
+        if value is None:
+            return
+        self.macro_vars[i][1].set(value)
+        self._refresh_macro_buttons()
+        self._save_config()
+
+    def _edit_macro_label(self, i):
+        value = self._ask_string(
+            f"Label macro {i + 1}",
+            "Button label:",
+            self.macro_vars[i][0].get())
+        if value is None:
+            return
+        self.macro_vars[i][0].set(value)
+        self._refresh_macro_buttons()
+        self._save_config()
+
+    @staticmethod
+    def _macro_preview_text(text):
+        shown = text.replace("\r", "\\r").replace("\n", "\\n")
+        if len(shown) > 20:
+            shown = shown[:19] + "…"
+        return f"`{shown}`"
+
     def _refresh_macro_buttons(self):
-        for i, b in enumerate(getattr(self, "macro_buttons", [])):
+        names = getattr(self, "macro_name_lbls", [])
+        previews = getattr(self, "macro_preview_lbls", [])
+        for i, name in enumerate(names):
             label = self.macro_vars[i][0].get().strip() or f"Macro {i + 1}"
-            b.configure(text=label)
+            name.configure(text=label)
+            previews[i].configure(text=self._macro_preview_text(
+                self.macro_vars[i][1].get()))
 
     def _hist_up(self, _e):
         if self.history and self.hist_idx > 0:
