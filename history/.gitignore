@@ -1,0 +1,4 @@
+# Session logs are per-user and must not be committed.
+*
+!.gitignore
+!readme.md

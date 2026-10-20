@@ -16,6 +16,7 @@ Features:
     * Configurable macro buttons (edit/label next to each button; text sent + line ending)
     * RTS / DTR toggles and CTS / DSR / RI / CD indicators
     * Send box at the bottom (text sent + "\r\n")
+    * Session history logs under history/ (unfiltered, kept for 30 days)
     * Dark theme
 """
 
@@ -26,7 +27,9 @@ import re
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -37,7 +40,12 @@ except ImportError:  # pragma: no cover
     raise SystemExit("pyserial is required:  pip install pyserial")
 
 APP_TITLE = "Serial Terminal"
+APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".serial_terminal.json"
+HISTORY_DIR = APP_DIR / "history"
+HISTORY_KEEP_DAYS = 30
+SESSION_LOG_NAME_RE = re.compile(
+    r"^session_(\d{4}-\d{2}-\d{2})_(\d{6})\.log$")
 LINE_END = "\r\n"   # default TX terminator; selectable on the Config tab
 TX_ENDINGS = {
     "CR+LF (\\r\\n)": "\r\n",
@@ -50,6 +58,9 @@ MAX_DISPLAY_LINES = 5_000    # lines kept in the text widget
 NUM_MACROS = 8
 NUM_HIGHLIGHTS = 4
 HL_DEFAULT_COLOR = "#ff00ff"   # magenta
+TERM_FONT_DEFAULT = 10
+TERM_FONT_MIN = 8
+TERM_FONT_MAX = 28
 
 # ---------------------------------------------------------------- theme
 BG = "#1e1e1e"
@@ -128,6 +139,76 @@ def strip_ansi(line):
     return CSI_RE.sub("", line)
 
 
+def _session_log_datetime(path):
+    """Best-effort session start time from filename, else file mtime."""
+    m = SESSION_LOG_NAME_RE.match(path.name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y-%m-%d%H%M%S")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return datetime.now()
+
+
+def prune_history_logs(directory, keep_days=HISTORY_KEEP_DAYS):
+    cutoff = datetime.now() - timedelta(days=keep_days)
+    try:
+        for path in directory.glob("*.log"):
+            if _session_log_datetime(path) < cutoff:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+class SessionLog:
+    """Append-only session file under history/. Safe to call from the UI thread."""
+
+    def __init__(self, directory):
+        self.path = None
+        self._fp = None
+        self._lock = threading.Lock()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            prune_history_logs(directory)
+            stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            self.path = directory / f"session_{stamp}.log"
+            self._fp = open(self.path, "a", encoding="utf-8", newline="\n", buffering=1)
+        except OSError:
+            self.path = None
+            self._fp = None
+            return
+        self.event("SYS", f"Session started ({self.path.name})")
+
+    def event(self, kind, text):
+        if self._fp is None:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        payload = strip_ansi(str(text)).replace("\r", "\\r").replace("\n", "\\n")
+        line = f"{ts} [{kind}] {payload}\n"
+        with self._lock:
+            try:
+                self._fp.write(line)
+                self._fp.flush()
+            except OSError:
+                pass
+
+    def close(self):
+        self.event("SYS", "Session ended")
+        with self._lock:
+            if self._fp is not None:
+                try:
+                    self._fp.close()
+                except OSError:
+                    pass
+                self._fp = None
+
+
 # ---------------------------------------------------------------- reader thread
 class SerialReader(threading.Thread):
     """Reads bytes and emits only COMPLETE lines terminated by CRLF."""
@@ -179,7 +260,7 @@ class SerialApp(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1000x720")
-        self.minsize(760, 500)
+        self.minsize(760, 400)
 
         self.ser = None
         self.reader = None
@@ -188,6 +269,9 @@ class SerialApp(tk.Tk):
         self.fg_tags = set()
         self.history, self.hist_idx = [], 0
         self._filter_job = None
+        self._logged_out_lines = None
+        self._logged_in_lines = {}
+        self.session_log = SessionLog(HISTORY_DIR)
 
         self.cfg = self._load_config()
         self._build_style()
@@ -195,6 +279,10 @@ class SerialApp(tk.Tk):
         self._build_ui()
         self.refresh_ports()
         self._update_connection_ui()
+        if self.session_log.path:
+            self._sys(f"Recording session to {self.session_log.path}")
+        else:
+            self._sys(f"Could not create a session log in {HISTORY_DIR}")
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(30, self._poll_queue)
@@ -206,6 +294,7 @@ class SerialApp(tk.Tk):
             "port": "", "baud": "115200", "bytesize": "8", "parity": "None",
             "stopbits": "1", "flow": "None", "line_ending": "CR+LF (\\r\\n)",
             "signals_on_connect": False, "echo": True, "autoscroll": True,
+            "term_font_size": TERM_FONT_DEFAULT,
             "macros": [{"label": "", "text": ""} for _ in range(NUM_MACROS)],
             "highlights": [{"enabled": False, "text": "", "color": HL_DEFAULT_COLOR}
                            for _ in range(NUM_HIGHLIGHTS)],
@@ -224,6 +313,11 @@ class SerialApp(tk.Tk):
         defaults["highlights"] = [
             {"enabled": bool(h.get("enabled", False)), "text": str(h.get("text", "")),
              "color": str(h.get("color") or HL_DEFAULT_COLOR)} for h in hls]
+        try:
+            defaults["term_font_size"] = max(
+                TERM_FONT_MIN, min(TERM_FONT_MAX, int(defaults["term_font_size"])))
+        except (TypeError, ValueError):
+            defaults["term_font_size"] = TERM_FONT_DEFAULT
         return defaults
 
     def _save_config(self):
@@ -234,6 +328,7 @@ class SerialApp(tk.Tk):
             "line_ending": self.ending_var.get(),
             "signals_on_connect": self.sig_on_connect_var.get(),
             "echo": self.echo_var.get(), "autoscroll": self.autoscroll_var.get(),
+            "term_font_size": self.term_font_size,
             "macros": [{"label": l.get().strip(), "text": t.get()}
                        for l, t in self.macro_vars],
             "highlights": [{"enabled": en.get(), "text": tx.get(),
@@ -273,8 +368,9 @@ class SerialApp(tk.Tk):
         s.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[
             ("selected", ACCENT), ("!selected", BG_INPUT)])
         s.configure("Toggle.TCheckbutton", background=BG_INPUT, padding=(10, 4))
-        s.map("Toggle.TCheckbutton", background=[("selected", "#2e7d32"),
-                                                  ("active", "#3e3e42")])
+        s.map("Toggle.TCheckbutton",
+              background=[("selected", "#2e7d32"), ("!selected", BG_INPUT),
+                          ("active", "#3e3e42")])
         s.configure("TNotebook", background=BG, bordercolor=BORDER)
         s.configure("TNotebook.Tab", background=BG_ALT, foreground=FG_DIM,
                     padding=(16, 6))
@@ -314,13 +410,16 @@ class SerialApp(tk.Tk):
         self._hl_job = None
         self.macro_vars = [(tk.StringVar(value=m["label"]), tk.StringVar(value=m["text"]))
                            for m in c["macros"]]
+        self.term_font_size = c["term_font_size"]
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
-        # Packed with side="bottom": first widget is at the very bottom.
-        # Order from bottom to top: Highlights, Macros, Send.
+        # Grid so the notebook/terminal absorbs extra space and the tool
+        # bars (send, macros, highlights) always keep their full height.
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1, minsize=80)
+
         hf = ttk.LabelFrame(self, text="Highlights", padding=6)
-        hf.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
         for i, (en, tx) in enumerate(self.hl_vars):
             slot = ttk.Frame(hf)
             slot.grid(row=0, column=i, sticky="ew", padx=4)
@@ -339,7 +438,6 @@ class SerialApp(tk.Tk):
             tx.trace_add("write", lambda *a: self._schedule_rehighlight())
 
         mf = ttk.LabelFrame(self, text="Macros", padding=6)
-        mf.pack(side="bottom", fill="x", padx=8, pady=(0, 2))
         self.macro_buttons = []
         self.macro_name_lbls = []
         self.macro_preview_lbls = []
@@ -374,7 +472,6 @@ class SerialApp(tk.Tk):
         self._refresh_macro_buttons()
 
         bottom = ttk.Frame(self, padding=(8, 4, 8, 6))
-        bottom.pack(side="bottom", fill="x")
         ttk.Label(bottom, text="Send:").pack(side="left")
         self.send_entry = ttk.Entry(bottom, textvariable=self.send_var)
         self.send_entry.pack(side="left", fill="x", expand=True, padx=6)
@@ -386,7 +483,6 @@ class SerialApp(tk.Tk):
         self.send_btn.pack(side="left")
 
         self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
         term = ttk.Frame(self.nb, padding=6)
         conf = ttk.Frame(self.nb, padding=12)
         self.nb.add(term, text="Terminal")
@@ -394,10 +490,18 @@ class SerialApp(tk.Tk):
         self._build_terminal_tab(term)
         self._build_config_tab(conf)
 
+        self.nb.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 0))
+        bottom.grid(row=1, column=0, sticky="ew")
+        mf.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 2))
+        hf.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+
     def _build_terminal_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
         # Row 1: connect + status + filter
         top = ttk.Frame(parent)
-        top.pack(fill="x")
+        top.grid(row=0, column=0, sticky="ew")
         self.connect_btn = ttk.Button(top, text="Connect", style="Accent.TButton",
                                       width=12, command=self.toggle_connection)
         self.connect_btn.pack(side="left")
@@ -417,7 +521,7 @@ class SerialApp(tk.Tk):
 
         # Row 2: hardware signals + log controls
         sf = ttk.Frame(parent)
-        sf.pack(fill="x", pady=(8, 4))
+        sf.grid(row=1, column=0, sticky="ew", pady=(8, 4))
         self.rts_btn = ttk.Checkbutton(sf, text="RTS", style="Toggle.TCheckbutton",
                                        variable=self.rts_var, command=self._apply_rts)
         self.rts_btn.pack(side="left")
@@ -437,27 +541,47 @@ class SerialApp(tk.Tk):
                         ).pack(side="right", padx=6)
         ttk.Checkbutton(sf, text="Echo sent", variable=self.echo_var
                         ).pack(side="right", padx=6)
+        zoom = ttk.Frame(sf)
+        zoom.pack(side="right", padx=(0, 8))
+        self._icon_button(zoom, "zoom_out", "Smaller terminal text",
+                          lambda: self._nudge_term_font(-1), size=20,
+                          defer=False).pack(side="left", padx=2)
+        self.term_font_lbl = ttk.Label(zoom, width=5, foreground=FG_DIM, anchor="center")
+        self.term_font_lbl.pack(side="left")
+        self._icon_button(zoom, "zoom_in", "Larger terminal text",
+                          lambda: self._nudge_term_font(1), size=20,
+                          defer=False).pack(side="left", padx=2)
 
-        # Log view
+        # Log view: height/width=1 so Tk will shrink this instead of the tool bars.
         lf = ttk.Frame(parent)
-        lf.pack(fill="both", expand=True)
+        lf.grid(row=2, column=0, sticky="nsew")
+        family = self._mono_family()
+        self.term_font = tkfont.Font(self, family=family, size=self.term_font_size)
+        self.term_bold_font = tkfont.Font(self, family=family, size=self.term_font_size,
+                                          weight="bold")
         self.text = tk.Text(lf, bg=BG, fg=FG, insertbackground=FG, wrap="none",
                             relief="flat", highlightthickness=1,
                             highlightbackground=BORDER, highlightcolor=BORDER,
                             selectbackground="#264f78", selectforeground="#ffffff",
-                            font=self._mono_font(), state="disabled", undo=False)
+                            font=self.term_font, state="disabled", undo=False,
+                            width=1, height=1)
         vs = ttk.Scrollbar(lf, orient="vertical", command=self.text.yview)
         hs = ttk.Scrollbar(lf, orient="horizontal", command=self.text.xview)
         self.text.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
         vs.pack(side="right", fill="y")
         hs.pack(side="bottom", fill="x")
         self.text.pack(side="left", fill="both", expand=True)
-        bold_font = (self._mono_font()[0], self._mono_font()[1], "bold")
-        self.text.tag_configure("bold", font=bold_font)
+        self.text.tag_configure("bold", font=self.term_bold_font)
         self.text.tag_configure("tx", foreground=TX_COLOR)
         self.text.tag_configure("sys", foreground=SYS_COLOR)
         for i, color in enumerate(self.hl_colors):
             self.text.tag_configure(f"hl{i}", background=color)
+        self._apply_term_font()
+        for seq, delta in (("<Control-plus>", 1), ("<Control-equal>", 1),
+                           ("<Control-KP_Add>", 1), ("<Control-minus>", -1),
+                           ("<Control-KP_Subtract>", -1)):
+            self.text.bind(seq, lambda e, d=delta: self._nudge_term_font(d) or "break")
+            parent.bind(seq, lambda e, d=delta: self._nudge_term_font(d) or "break")
 
     def _build_config_tab(self, parent):
         sp = ttk.LabelFrame(parent, text="Serial port", padding=12)
@@ -496,14 +620,29 @@ class SerialApp(tk.Tk):
         self.settings_note.configure(text=f"Saved to {CONFIG_PATH}")
 
     @staticmethod
-    def _mono_font():
-        import tkinter.font as tkfont
+    def _mono_family():
         fams = set(tkfont.families())
         for f in ("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Ubuntu Mono",
                   "Liberation Mono", "Courier New"):
             if f in fams:
-                return (f, 10)
-        return ("TkFixedFont", 10)
+                return f
+        return "TkFixedFont"
+
+    def _mono_font(self):
+        return (self._mono_family(), self.term_font_size)
+
+    def _nudge_term_font(self, delta):
+        self.term_font_size = max(
+            TERM_FONT_MIN, min(TERM_FONT_MAX, self.term_font_size + delta))
+        self._apply_term_font()
+        self._save_config()
+
+    def _apply_term_font(self):
+        if getattr(self, "term_font", None):
+            self.term_font.configure(size=self.term_font_size)
+            self.term_bold_font.configure(size=self.term_font_size)
+        if getattr(self, "term_font_lbl", None):
+            self.term_font_lbl.configure(text=f"{self.term_font_size} pt")
 
     # ------------------------------------------------------------ ports
     def refresh_ports(self):
@@ -557,20 +696,21 @@ class SerialApp(tk.Tk):
             ser.dsrdtr = flow == "DSR/DTR"
             ser.xonxoff = flow == "XON/XOFF"
             apply_sig = self.sig_on_connect_var.get()
-            is_win = sys.platform.startswith("win")
-            # Windows applies RTS/DTR through the DCB at open time, so presetting
-            # them before open() is the cleanest option there.
-            if apply_sig and is_win:
+            # Store the desired levels before open() so pyserial can apply them
+            # at the end of open() instead of forcing both lines high first.
+            if apply_sig:
                 if not ser.rtscts:
                     ser.rts = self.rts_var.get()
                 if not ser.dsrdtr:
                     ser.dtr = self.dtr_var.get()
             ser.open()
-            if apply_sig and not is_win:
-                self._apply_signals_ordered(ser)
-            elif not apply_sig:
+            if apply_sig:
+                self._set_output_lines(ser)
+            else:
                 self._sync_signal_buttons(ser)
+                self._remember_output_lines(ser)
         except (serial.SerialException, ValueError, OSError) as e:
+            self.session_log.event("CONN", f"Failed to open {port}: {e}")
             messagebox.showerror(APP_TITLE, f"Could not open {port}:\n{e}")
             return
 
@@ -578,28 +718,72 @@ class SerialApp(tk.Tk):
         self.reader = SerialReader(ser, self.rx_queue)
         self.reader.start()
         self._save_config()
+        self._logged_out_lines = None
+        self._logged_in_lines = {}
+        self.session_log.event(
+            "CONN",
+            f"Connected port={port} baud={baud} "
+            f"bytesize={self.bytesize_var.get()} parity={self.parity_var.get()} "
+            f"stopbits={self.stopbits_var.get()} flow={self.flow_var.get()} "
+            f"line_ending={self.ending_var.get()} "
+            f"set_rts_dtr_on_connect={apply_sig}")
         self._sys(f"Connected to {port} @ {baud} "
                   f"{self.bytesize_var.get()}{self.parity_var.get()[0]}"
                   f"{self.stopbits_var.get()}, flow: {self.flow_var.get()}")
         self.status_var.set(f"Connected: {port} @ {baud}")
         self._update_connection_ui()
+        # CP210x / WSL often ignore the first TIOCM change right after open.
+        if apply_sig:
+            self.after(50, self._set_output_lines)
 
-    def _apply_signals_ordered(self, ser):
-        """Apply the RTS/DTR button states after open (POSIX).
+    def _set_output_lines(self, ser=None):
+        """Write RTS and DTR together in an ESP32-safe order.
 
-        The OS asserts both lines when a port is opened. Writing DTR before RTS
-        would pass through DTR=0/RTS=1, which resets ESP32/ESP8266 auto-reset
-        circuits. Lowering RTS first (or raising DTR first) avoids that.
+        Setting one line at a time can glitch the other on CP2102/CH340, and
+        DTR=0 while RTS=1 is the auto-reset pulse. If RTS is being lowered,
+        drop RTS first; otherwise raise DTR first.
         """
+        ser = self.ser if ser is None else ser
+        if ser is None or not getattr(ser, "is_open", False):
+            return
+        rts = bool(self.rts_var.get())
+        dtr = bool(self.dtr_var.get())
         steps = []
         if not ser.dsrdtr:
-            steps.append(("dtr", self.dtr_var.get()))
+            steps.append(("dtr", dtr))
         if not ser.rtscts:
-            steps.append(("rts", self.rts_var.get()))
-        if not self.rts_var.get():
+            steps.append(("rts", rts))
+        if not rts:
             steps.reverse()
-        for attr, val in steps:
-            setattr(ser, attr, val)
+        try:
+            for attr, val in steps:
+                setattr(ser, attr, val)
+        except (serial.SerialException, OSError) as e:
+            self._sys(f"RTS/DTR error: {e}")
+            self.session_log.event("SIG", f"RTS/DTR error: {e}")
+            return
+        self._remember_output_lines(ser, rts=rts, dtr=dtr)
+
+    def _remember_output_lines(self, ser, rts=None, dtr=None):
+        try:
+            if rts is None and not ser.rtscts:
+                rts = bool(ser.rts)
+            if dtr is None and not ser.dsrdtr:
+                dtr = bool(ser.dtr)
+        except (serial.SerialException, OSError):
+            return
+        out = (None if ser.rtscts else bool(rts) if rts is not None else None,
+               None if ser.dsrdtr else bool(dtr) if dtr is not None else None)
+        if out == self._logged_out_lines:
+            return
+        self._logged_out_lines = out
+        parts = []
+        if out[0] is not None:
+            parts.append(f"RTS={int(out[0])}")
+        if out[1] is not None:
+            parts.append(f"DTR={int(out[1])}")
+        if parts:
+            self.session_log.event("SIG", " ".join(parts))
 
     def _sync_signal_buttons(self, ser):
         """Leave the lines as the OS/driver set them; show that state on the buttons."""
@@ -623,7 +807,11 @@ class SerialApp(tk.Tk):
                 pass
             self.ser = None
         self.status_var.set("Disconnected")
-        self._sys(reason or "Disconnected")
+        msg = reason or "Disconnected"
+        self.session_log.event("CONN", msg)
+        self._logged_out_lines = None
+        self._logged_in_lines = {}
+        self._sys(msg)
         self._update_connection_ui()
 
     def _update_connection_ui(self):
@@ -645,29 +833,34 @@ class SerialApp(tk.Tk):
                 l.configure(bg=BG_ALT, fg=FG_DIM)
 
     def _apply_rts(self):
-        if self.connected and not self.ser.rtscts:
-            try:
-                self.ser.rts = self.rts_var.get()
-            except (serial.SerialException, OSError) as e:
-                self._sys(f"RTS error: {e}")
+        self._set_output_lines()
 
     def _apply_dtr(self):
-        if self.connected and not self.ser.dsrdtr:
-            try:
-                self.ser.dtr = self.dtr_var.get()
-            except (serial.SerialException, OSError) as e:
-                self._sys(f"DTR error: {e}")
+        self._set_output_lines()
 
     def _poll_modem_lines(self):
         if self.connected:
             try:
-                states = {"CTS": self.ser.cts, "DSR": self.ser.dsr,
-                          "RI": self.ser.ri, "CD": self.ser.cd}
+                states = {"CTS": bool(self.ser.cts), "DSR": bool(self.ser.dsr),
+                          "RI": bool(self.ser.ri), "CD": bool(self.ser.cd)}
+                if not self._logged_in_lines:
+                    self.session_log.event(
+                        "SIG",
+                        "inputs " + " ".join(f"{n}={int(v)}" for n, v in states.items()))
+                else:
+                    for name, v in states.items():
+                        prev = self._logged_in_lines.get(name)
+                        if prev is not None and prev != v:
+                            self.session_log.event(
+                                "SIG", f"{name} {int(prev)} -> {int(v)}")
+                self._logged_in_lines = states
                 for name, v in states.items():
                     self.ind[name].configure(bg="#2e7d32" if v else BG_ALT,
                                              fg="#ffffff" if v else FG_DIM)
             except (serial.SerialException, OSError):
                 pass
+        else:
+            self._logged_in_lines = {}
         self.after(250, self._poll_modem_lines)
 
     # ------------------------------------------------------------ sending
@@ -680,6 +873,7 @@ class SerialApp(tk.Tk):
         except (serial.SerialException, OSError) as e:
             self.disconnect(f"Write failed: {e}")
             return False
+        self.session_log.event("TX", text)
         if self.echo_var.get():
             self._add_line("tx", text)
         return True
@@ -701,8 +895,7 @@ class SerialApp(tk.Tk):
             return
         self._write_line(text)
 
-    def _icon_button(self, parent, kind, tooltip, command):
-        size = 16
+    def _icon_button(self, parent, kind, tooltip, command, size=16, defer=True):
         cv = tk.Canvas(parent, width=size, height=size, bg=BG,
                        highlightthickness=0, cursor="hand2", borderwidth=0)
         self._draw_icon(cv, kind, size, FG_DIM, BG)
@@ -737,9 +930,12 @@ class SerialApp(tk.Tk):
 
         def click(_e):
             hide_tip()
-            # Open after this click finishes so the same mouse-up cannot
+            # Defer dialog-opening commands so the same mouse-up cannot
             # dismiss the dialog before the user types anything.
-            self.after_idle(command)
+            if defer:
+                self.after_idle(command)
+            else:
+                command()
 
         cv.bind("<Button-1>", click)
         cv.bind("<Enter>", enter)
@@ -766,10 +962,21 @@ class SerialApp(tk.Tk):
             cv.create_polygon(pts, fill=color, outline=color, smooth=False)
             cv.create_oval(cx - r_hole, cy - r_hole, cx + r_hole, cy + r_hole,
                            fill=bg, outline=bg)
-        else:  # tag
+        elif kind == "tag":
             pts = (2, 3, 10, 3, 14, 8, 10, 13, 2, 13)
             cv.create_polygon(pts, fill=color, outline=color)
             cv.create_oval(4, 6.5, 7.2, 9.7, fill=bg, outline=bg)
+        else:  # zoom_in / zoom_out  (magnifying glass + / -)
+            gx, gy = size * 0.40, size * 0.40
+            r = size * 0.28
+            cv.create_oval(gx - r, gy - r, gx + r, gy + r, outline=color, width=2)
+            cv.create_line(gx + r * 0.62, gy + r * 0.62, size * 0.90, size * 0.90,
+                           fill=color, width=2, capstyle=tk.ROUND)
+            s = r * 0.42
+            cv.create_line(gx - s, gy, gx + s, gy, fill=color, width=2, capstyle=tk.ROUND)
+            if kind == "zoom_in":
+                cv.create_line(gx, gy - s, gx, gy + s, fill=color, width=2,
+                               capstyle=tk.ROUND)
 
     def _macro_hover(self, i, on):
         if not getattr(self, "macro_buttons", None) or i >= len(self.macro_buttons):
@@ -901,6 +1108,7 @@ class SerialApp(tk.Tk):
             for _ in range(2000):
                 kind, payload = self.rx_queue.get_nowait()
                 if kind == "line":
+                    self.session_log.event("RX", payload)
                     self.lines.append(("rx", payload))
                     if self._matches("rx", payload):
                         batch.append(("rx", payload))
@@ -1050,6 +1258,7 @@ class SerialApp(tk.Tk):
         self._save_config()
         if self.connected:
             self.disconnect()
+        self.session_log.close()
         self.destroy()
 
 
